@@ -11,6 +11,7 @@ equivalent to the local render, not a pixel clone. Uses the standard library plu
 requests, which the project already depends on.
 """
 
+import mimetypes
 import os
 import random
 import shutil
@@ -96,24 +97,90 @@ _progress_lock = threading.Lock()
 
 
 def _upload_one(path: str) -> str:
+    """Upload a local file via the /assets flow and return its content URL.
+
+    The old POST /uploads endpoint was removed. Uploads now go: init (reserve
+    the asset, get presigned R2 target(s)) -> PUT bytes straight to R2 (single
+    PUT or multipart) -> complete (finalize). The file is referenced downstream
+    by the asset's content `url`.
+    """
     file_path = Path(path)
     if not file_path.is_file():
         raise RendobarError(f"input not found: {path}")
 
-    def post():
-        with file_path.open("rb") as stream:
-            return requests.post(
-                f"{BASE_URL}/uploads",
-                headers=_headers(),
-                params={"filename": file_path.name},
-                data=stream,
-                timeout=300,
-            )
+    name = file_path.name
+    size = file_path.stat().st_size
+    content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
 
-    resp = _send(post, f"upload of {file_path.name}")
-    url = _check(resp, f"upload of {file_path.name}").get("data", {}).get("downloadUrl")
+    # 1. Init. The response is a discriminated union at the top level
+    # (status + data + upload), not a { data } envelope.
+    def init_post():
+        return requests.post(
+            f"{BASE_URL}/assets",
+            headers=_headers(),
+            json={"filename": name, "size": size, "contentType": content_type, "lifecycle": "ephemeral"},
+            timeout=60,
+        )
+
+    init = _check(_send(init_post, f"upload init for {name}"), f"upload init for {name}")
+    status = init.get("status")
+
+    # Identical file already uploaded for this org — reuse it, nothing to send.
+    if status == "deduplicated":
+        url = init.get("data", {}).get("url")
+        if not url:
+            raise RendobarError(f"upload of {name} returned no url")
+        return url
+
+    asset_id = init.get("data", {}).get("id")
+    upload = init.get("upload", {})
+
+    # 2. PUT bytes straight to R2. Presigned URLs carry their own auth; send no
+    # extra headers (matches the official SDK).
+    complete_body: dict = {}
+    if status == "multipart":
+        part_size = upload["partSize"]
+        uploaded = []
+        with file_path.open("rb") as fh:
+            for part in sorted(upload["parts"], key=lambda p: p["partNumber"]):
+                fh.seek((part["partNumber"] - 1) * part_size)
+                chunk = fh.read(part_size)
+
+                def put_part(u=part["url"], body=chunk):
+                    return requests.put(u, data=body, timeout=300)
+
+                res = _send(put_part, f"upload part {part['partNumber']} of {name}")
+                if not res.ok:
+                    raise RendobarError(f"upload part {part['partNumber']} of {name} failed: HTTP {res.status_code}")
+                etag = res.headers.get("ETag") or res.headers.get("etag")
+                uploaded.append({"partNumber": part["partNumber"], "etag": etag})
+        complete_body = {"parts": uploaded}
+    else:
+        # status == "presigned" (single PUT). Server reads the ETag at complete.
+        def put_one():
+            with file_path.open("rb") as stream:
+                return requests.put(upload["url"], data=stream, timeout=300)
+
+        res = _send(put_one, f"upload of {name}")
+        if not res.ok:
+            raise RendobarError(f"upload of {name} failed: HTTP {res.status_code}")
+
+    # 3. Finalize.
+    final = _check(
+        _send(
+            lambda: requests.post(
+                f"{BASE_URL}/assets/{asset_id}/complete",
+                headers=_headers(),
+                json=complete_body,
+                timeout=60,
+            ),
+            f"finalize {name}",
+        ),
+        f"finalize {name}",
+    )
+    url = final.get("data", {}).get("url")
     if not url:
-        raise RendobarError(f"upload of {file_path.name} returned no downloadUrl")
+        raise RendobarError(f"upload of {name} returned no url")
     return url
 
 
